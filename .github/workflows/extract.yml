@@ -1,5 +1,5 @@
 
-name: Extract uploaded project ZIP
+name: Extract APK Builder Project
 
 on:
   workflow_dispatch:
@@ -10,23 +10,72 @@ permissions:
 jobs:
   extract:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract project
+      - name: Check ZIP file
         run: |
+          if [ ! -f "app-builder-main.zip" ]; then
+            echo "ERROR: app-builder-main.zip not found"
+            exit 1
+          fi
+
+      - name: Extract project ZIP
+        run: |
+          set -e
+
           mkdir -p /tmp/apkit
           unzip -q app-builder-main.zip -d /tmp/apkit
-          cp -R /tmp/apkit/app-builder-main/. .
+
+          SOURCE_DIR="/tmp/apkit/app-builder-main"
+
+          if [ ! -d "$SOURCE_DIR" ]; then
+            echo "ERROR: Expected app-builder-main folder not found"
+            echo "ZIP contents:"
+            ls -la /tmp/apkit
+            exit 1
+          fi
+
+          # Do not copy nested GitHub workflows or Git metadata
+          rm -rf "$SOURCE_DIR/.github"
+          rm -rf "$SOURCE_DIR/.git"
+
+          # Copy project files into repository root
+          cp -R "$SOURCE_DIR"/. .
+
+          # Remove original ZIP after successful extraction
           rm app-builder-main.zip
+
+      - name: Verify extracted project
+        run: |
+          set -e
+
+          test -f "Dockerfile"
+          test -f "requirements.txt"
+          test -d "app"
+          test -d "web"
+
+          echo "Project extraction verified successfully"
+          echo "Backend and frontend files found"
 
       - name: Commit extracted files
         run: |
+          set -e
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "Extract APK builder project"
-            git push
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Extract APK Builder project files"
+            git push origin HEAD:main
           fi
+
+      - name: Extraction completed
+        run: |
+          echo "APK Builder project extraction completed"
