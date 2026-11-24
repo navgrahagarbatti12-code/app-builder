@@ -1,0 +1,268 @@
+"""Central configuration, all overridable via environment variables.
+
+Mirrors the original ``src/config.js`` 1:1 — same variable names, same
+defaults, same rationale. Kept as a single frozen dataclass instantiated
+once at import time so every module shares one source of truth, the same
+role ``config.js``'s ``module.exports`` object played.
+"""
+from __future__ import annotations
+
+import os
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_str(name: str, default: str) -> str:
+    return os.environ.get(name) or default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass(frozen=True)
+class Settings:
+    # Most platforms inject PORT themselves — the app must listen on
+    # whatever it sets. Falls back to 8000 for local/bare use.
+    PORT: int = field(default_factory=lambda: _env_int("PORT", 8000))
+
+    # Builds share this one container's CPU/RAM directly. Default is
+    # deliberately conservative — Gradle + the Android Gradle Plugin alone
+    # can use 1.5-2.5GB per concurrent build, on top of whatever the API
+    # server itself needs. Size this against your host/plan's actual RAM,
+    # not against how many CPU cores it has.
+    MAX_CONCURRENT_BUILDS: int = field(default_factory=lambda: _env_int("MAX_CONCURRENT_BUILDS", 2))
+
+    BUILD_TIMEOUT_MS: int = field(default_factory=lambda: _env_int("BUILD_TIMEOUT_MS", 15 * 60 * 1000))
+    MAX_UPLOAD_BYTES: int = field(default_factory=lambda: _env_int("MAX_UPLOAD_BYTES", 300 * 1024 * 1024))
+
+    JOB_ROOT: Path = field(
+        default_factory=lambda: Path(os.environ.get("JOB_ROOT") or Path(tempfile.gettempdir()) / "apk-builder-jobs")
+    )
+    JOB_TTL_MS: int = field(default_factory=lambda: _env_int("JOB_TTL_MS", 60 * 60 * 1000))
+
+    # Caps how many log lines a single job keeps *in memory* — a verbose
+    # Gradle/npm build can easily emit thousands of lines, and every job
+    # otherwise stayed fully resident (job_store.Job.logs) until the TTL
+    # sweep, regardless of how long it had already finished. The full,
+    # untruncated log is still written line-by-line to disk (job.log_file
+    # — see job_store.py) so nothing is actually lost; this only bounds
+    # what's held in RAM and replayed to a freshly (re)connecting SSE
+    # client. Raise this if the dashboard's log view is expected to show
+    # very long builds in full without a "download full log" round trip.
+    JOB_LOG_BUFFER_LINES: int = field(default_factory=lambda: _env_int("JOB_LOG_BUFFER_LINES", 2000))
+
+    # Per-subscriber cap on job_store.EventBus's fan-out queues. Without
+    # this, a browser tab that stops reading its SSE stream (backgrounded,
+    # a dead connection the server hasn't noticed yet) lets that
+    # subscriber's asyncio.Queue grow without bound for the entire life of
+    # a chatty build. When full, the oldest buffered event is dropped in
+    # favor of the newest — a stalled viewer losing some middle-of-build
+    # events is fine; unbounded memory growth per idle tab is not.
+    SSE_QUEUE_MAXSIZE: int = field(default_factory=lambda: _env_int("SSE_QUEUE_MAXSIZE", 1000))
+
+    # How often job_store.memory_pressure_sweep_loop() checks real free
+    # memory and, independently of the slower JOB_TTL_MS/ttl_sweep_loop
+    # above, purges finished (success/failed/stopped) jobs early if this
+    # container is genuinely low on RAM.
+    MEMORY_PRESSURE_CHECK_INTERVAL_S: int = field(
+        default_factory=lambda: _env_int("MEMORY_PRESSURE_CHECK_INTERVAL_S", 30)
+    )
+    # Grace period a *finished* job is guaranteed to survive even under
+    # memory pressure, before memory_pressure_sweep_loop() is allowed to
+    # purge it early — short enough to actually relieve a real squeeze
+    # (unlike waiting out the full JOB_TTL_MS), long enough that a person
+    # who just watched their build finish doesn't lose it before they've
+    # had a chance to download the APK or read the log.
+    MEMORY_PRESSURE_JOB_TTL_MS: int = field(
+        default_factory=lambda: _env_int("MEMORY_PRESSURE_JOB_TTL_MS", 5 * 60 * 1000)
+    )
+
+    # Frontend and API are served from this same service by default, so
+    # cross-origin requests aren't the normal case here — kept available in
+    # case the frontend is ever split out separately.
+    CORS_ORIGIN: str = field(default_factory=lambda: _env_str("CORS_ORIGIN", "*"))
+
+    RATE_LIMIT_MAX: int = field(default_factory=lambda: _env_int("RATE_LIMIT_MAX", 10))
+    RATE_LIMIT_WINDOW_MS: int = field(default_factory=lambda: _env_int("RATE_LIMIT_WINDOW_MS", 10 * 60 * 1000))
+
+    # Deliberately OUTSIDE JOB_ROOT (which per-job dirs live under and get
+    # wiped by purge_job/the TTL sweep) — shared across every job for as
+    # long as the container lives. Without them, every single build
+    # re-downloads the full Gradle distribution + every npm dependency from
+    # scratch, even though back-to-back builds in the same container almost
+    # always want the same handful of packages.
+    NPM_CACHE_DIR: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("NPM_CACHE_DIR") or Path(tempfile.gettempdir()) / "apk-builder-cache" / "npm"
+        )
+    )
+
+    # NOTE: intentionally NOT used as GRADLE_USER_HOME — see build_runner.py
+    # for the full "daemon registry vs dependency cache" rationale. This is
+    # the shared, persistent, read-only reuse of downloaded module/artifact
+    # caches + wrapper distributions across every job.
+    GRADLE_RO_DEP_CACHE: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("GRADLE_RO_DEP_CACHE")
+            or Path(tempfile.gettempdir()) / "apk-builder-cache" / "gradle-ro-cache"
+        )
+    )
+
+    # Gradle's *local build cache* (what --build-cache populates) — a
+    # separate thing from the dependency cache above, but just as safe to
+    # share across concurrent jobs. See app/shared-build-cache-init.gradle.
+    GRADLE_SHARED_BUILD_CACHE_DIR: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("GRADLE_SHARED_BUILD_CACHE_DIR")
+            or Path(tempfile.gettempdir()) / "apk-builder-cache" / "gradle-build-cache"
+        )
+    )
+
+    # A third, separate thing from both caches above: the Gradle wrapper's
+    # own distribution download (wrapper/dists/gradle-X-bin/.../gradle-X-
+    # bin.zip, extracted). GRADLE_RO_DEP_CACHE only covers *dependency*
+    # artifacts (modules-2) — it says nothing about the wrapper's own
+    # bootstrap zip, which lives under $GRADLE_USER_HOME/wrapper instead.
+    # Since GRADLE_USER_HOME is deliberately per-job (daemon registry
+    # isolation — see build_runner.py), without this every single build
+    # would silently re-download the *entire* Gradle distribution from
+    # services.gradle.org from scratch, even for a version this container
+    # has already built with a hundred times before. build_runner.py
+    # symlinks each job's wrapper/dists into this shared directory instead
+    # — safe to share concurrently, since Gradle's own wrapper bootstrap
+    # already uses per-distribution file locking for exactly this case.
+    GRADLE_DIST_CACHE_DIR: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("GRADLE_DIST_CACHE_DIR")
+            or Path(tempfile.gettempdir()) / "apk-builder-cache" / "gradle-wrapper-dists"
+        )
+    )
+
+    # Shared, persistent cache of fully-resolved node_modules trees, keyed
+    # by a hash of package-lock.json (+ a few env fingerprints) — see
+    # app/dep_cache.py.
+    DEP_CACHE_DIR: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("DEP_CACHE_DIR")
+            or Path(tempfile.gettempdir()) / "apk-builder-cache" / "node-modules-cache"
+        )
+    )
+    # Bounds disk usage: oldest-used cache entries are evicted once this
+    # many distinct lockfile hashes have accumulated.
+    DEP_CACHE_MAX_ENTRIES: int = field(default_factory=lambda: _env_int("DEP_CACHE_MAX_ENTRIES", 8))
+
+    # Same idea as NPM_CACHE_DIR/GRADLE_RO_DEP_CACHE above, but for
+    # Flutter's own package manager: pub. Set as $PUB_CACHE for every
+    # `flutter`/`dart` invocation (see build_runner.py's
+    # _run_flutter_build), so a pub package this container has already
+    # downloaded for one job's pubspec.lock is never re-fetched by the
+    # next job that happens to depend on it too. Unlike DEP_CACHE_DIR,
+    # this doesn't need its own hardlink/eviction machinery — pub's cache
+    # is already content-addressed by package name+version, so plain
+    # reuse across jobs is safe without any extra bookkeeping here.
+    PUB_CACHE_DIR: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("PUB_CACHE_DIR") or Path(tempfile.gettempdir()) / "apk-builder-cache" / "pub-cache"
+        )
+    )
+
+    # A proper (small) database for visitor/country analytics — SQLite,
+    # not another JSON blob: concurrent-safe writes via WAL mode, atomic
+    # upserts instead of read-modify-write-the-whole-file, and indexed
+    # COUNT/COUNT(DISTINCT) queries instead of scanning every record in
+    # Python on every request. See app/db.py. Deliberately alongside the
+    # caches above (not under JOB_ROOT, which per-job purge/TTL sweeps
+    # clean out) — persisted for as long as this container's volume lives.
+    VISITOR_DB_PATH: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("VISITOR_DB_PATH")
+            or Path(tempfile.gettempdir()) / "apk-builder-cache" / "visitors.db"
+        )
+    )
+    # Legacy pre-database store — if present at startup, its rows are
+    # imported into VISITOR_DB_PATH once (see app/db.py: migrate_legacy_json)
+    # and the file is then renamed aside, so nobody loses visitor history
+    # across the upgrade to a real database.
+    VISITOR_STORE_PATH: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("VISITOR_STORE_PATH")
+            or Path(tempfile.gettempdir()) / "apk-builder-cache" / "visitors.json"
+        )
+    )
+    # Free-tier IP geolocation lookup, used once per newly-seen IP (results
+    # are cached indefinitely in the database, never re-queried). Override
+    # to point at a self-hosted/paid resolver if this app runs somewhere
+    # that can't reach the public internet, or set to "" to disable country
+    # lookups entirely (visitors still get counted).
+    GEOIP_LOOKUP_URL: str = field(
+        default_factory=lambda: _env_str("GEOIP_LOOKUP_URL", "http://ip-api.com/json/{ip}?fields=status,countryCode")
+    )
+    GEOIP_TIMEOUT_S: float = field(default_factory=lambda: float(_env_str("GEOIP_TIMEOUT_S", "2.5")))
+
+    # Accounts + sessions (app/auth.py) — a small SQLite file, same pattern
+    # as VISITOR_DB_PATH above. Whether sign-in is actually required for
+    # the whole site is controlled by AUTH_REQUIRED just below — this path
+    # is only relevant while that's on.
+    #
+    # Login/register are hidden for now (AUTH_REQUIRED defaults to False):
+    # app/auth.py's require_auth dependency waves every request through as
+    # a shared guest identity instead of checking a token, and the
+    # frontend (web/src/App.jsx) goes straight to the dashboard. Nothing
+    # about the auth system itself was removed — every route, the signup/
+    # login/logout endpoints, and the AuthScreen component are unchanged
+    # and fully wired, so setting AUTH_REQUIRED=true (or "1") brings real
+    # per-account sign-in straight back with no code changes.
+    AUTH_REQUIRED: bool = field(default_factory=lambda: _env_bool("AUTH_REQUIRED", False))
+    AUTH_DB_PATH: Path = field(
+        default_factory=lambda: Path(
+            os.environ.get("AUTH_DB_PATH") or Path(tempfile.gettempdir()) / "apk-builder-cache" / "auth.db"
+        )
+    )
+    # How long a signed-in session stays valid without the person having to
+    # log in again. 30 days by default — this is a build tool, not a bank.
+    SESSION_TTL_MS: int = field(default_factory=lambda: _env_int("SESSION_TTL_MS", 30 * 24 * 60 * 60 * 1000))
+
+    # Optional AI-assisted troubleshooting for the error side panel (see
+    # app/assist.py). Talks directly to the Anthropic Messages API over
+    # httpx (already a dependency — no SDK needed for one endpoint). Unset
+    # by default: the site works fully without it, just with the built-in
+    # rule-based fallback instead of a model-generated answer.
+    ANTHROPIC_API_KEY: str = field(default_factory=lambda: _env_str("ANTHROPIC_API_KEY", ""))
+    ASSIST_MODEL: str = field(default_factory=lambda: _env_str("ASSIST_MODEL", "claude-haiku-4-5-20251001"))
+
+    # Real OOM prevention, not just a job-count ceiling — see
+    # build_runner.py's pump().
+    MIN_FREE_MEMORY_MB: int = field(default_factory=lambda: _env_int("MIN_FREE_MEMORY_MB", 512))
+
+    APP_ID: str = field(default_factory=lambda: _env_str("APP_ID", "com.builder.app"))
+    APP_NAME: str = field(default_factory=lambda: _env_str("APP_NAME", "MyApp"))
+    CAPACITOR_MAJOR: str = field(default_factory=lambda: _env_str("CAPACITOR_MAJOR", "7"))
+    # 'debug' matches what the other two project types produce (an
+    # unsigned, installable-as-is debug APK) and keeps `flutter build apk`
+    # from needing a release signing config the uploader hasn't provided.
+    # Override to "release" only if this deployment also wires up signing.
+    FLUTTER_BUILD_MODE: str = field(default_factory=lambda: _env_str("FLUTTER_BUILD_MODE", "debug"))
+
+    @property
+    def cors_origins(self) -> list[str]:
+        if self.CORS_ORIGIN == "*":
+            return ["*"]
+        return [o.strip() for o in self.CORS_ORIGIN.split(",") if o.strip()]
+
+
+settings = Settings()
